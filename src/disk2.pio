@@ -1,0 +1,47 @@
+; Disk II playback (PIO0 SM0, Apple II mode): one cell every 16 cycles; a 1 is RD low for 4
+; cycles (1 µs at 4 µs cells) from cycle 12, as a Disk II's read amplifier gives.
+;
+; A revolution is exactly as many cells as the track has, not a whole number of 32-cell words as
+; for the Mac (a padded loop has a few nibbles too many, and loaders that count a revolution's
+; nibbles fail: Dino Eggs, Crisis Mountain, Miner 2049er II, The Bilestoad, First Math
+; Adventures). Y counts the revolution's cells down. Each revolution's words are preceded in the
+; FIFO by its cell count less one (a DMA channel puts it there, `drive::STREAM_COUNT`); a word
+; used up is replaced at once, and at the revolution's end the rest of its last word is dropped.
+; The words of a revolution are always one more than its whole words: a last word with the
+; remaining cells, or one taken and dropped when there are none.
+;
+; Core 1 starts a track mid-revolution: it restarts the state machine, puts the cells left (less
+; one) in the FIFO ahead of the DMA's words, and executes `pull`, `mov y, osr`, `pull`,
+; `out null, k` (to the cell within the word) and `jmp cell` (`drive::Player::play_a2`).
+;
+; Cycles, from a cell's `out`: the bit is checked at 9, the next word pulled at 10 if needed,
+; RD low 12–15, the next cell's `out` at 16. Every path takes the same time. At a revolution's
+; end the `jmp start` is at 16 and the first cell's `out` at 20, 4 cycles short, so `check` is
+; at 25, as for any cell. `tests/host/a2_check.rs` runs this program; rerun it after a change.
+
+.program disk2
+.side_set 1
+public start:
+    pull block      side 1          ; the revolution's cells, less one
+    mov y, osr      side 1
+    pull block      side 1          ; its first word
+    out x, 1        side 1 [3]
+    jmp check       side 1
+public cell:
+    out x, 1        side 1 [8]
+check:
+    jmp !osre full  side 1
+    pull block      side 1          ; that was the word's last cell: the next word
+    jmp !x zero1    side 1
+    jmp y-- cell    side 0 [3]      ; a 1: RD low
+    jmp start       side 1          ; the revolution is over
+zero1:
+    jmp y-- cell    side 1 [3]
+    jmp start       side 1
+full:
+    jmp !x zero2    side 1 [1]
+    jmp y-- cell    side 0 [3]
+    jmp start       side 1
+zero2:
+    jmp y-- cell    side 1 [3]
+    jmp start       side 1

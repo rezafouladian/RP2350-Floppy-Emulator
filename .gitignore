@@ -1,0 +1,5 @@
+/target
+/.idea
+/tools/floppybench/build
+/tools/a2bench/build
+*.o

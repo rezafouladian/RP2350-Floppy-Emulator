@@ -1,0 +1,56 @@
+; Write-data separators (PIO1): turn the Mac's WR line into one bit per cell, 1 = flux
+; reversal, shifted MSB first into the ISR and autopushed every 32 cells. A transition is a 1; 1.5 cells
+; without one is a 0, and every further cell without one is another 0.
+;
+; Timing: each polling loop is 2 instructions, and the PIO clock is 32x the cell rate, so a
+; cell is 16 loop passes. X counts passes down; Y holds the constant 1 for `in y, 1`.
+; After an edge, the path to the loop costs about 2 passes, so the 1.5-cell window is set to 21
+; and the 1-cell window to 13 (a 0 at 1.5, 2.47, 3.44 cells). `tests/host/track_check.rs` runs these programs against
+; simulated write waveforms; rerun it after any change here.
+
+.program gcr_write
+; GCR is NRZI: every WR transition, rising or falling, is a 1.
+    set y, 1
+high:
+    set x, 21
+high_loop:              ; WR high: wait for it to fall
+    jmp pin high_wait
+    in y, 1
+    jmp low
+high_wait:
+    jmp x-- high_loop
+    in null, 1
+    set x, 13
+    jmp high_loop
+low:
+    set x, 21
+low_loop:               ; WR low: wait for it to rise
+    jmp pin low_edge
+    jmp x-- low_loop
+    in null, 1
+    set x, 13
+    jmp low_loop
+low_edge:
+    in y, 1
+    jmp high
+
+.program mfm_write
+; MFM: WR pulses low once per flux reversal; each falling edge is a 1. The time spent in the
+; pulse counts toward the next cell.
+    set y, 1
+    set x, 21
+wait_fall:              ; WR high: wait for a pulse
+    jmp pin high_tick
+    in y, 1
+    set x, 21
+pulse:                  ; WR low: wait for the pulse to end
+    jmp pin wait_fall
+    jmp x-- pulse
+    in null, 1
+    set x, 13
+    jmp pulse
+high_tick:
+    jmp x-- wait_fall
+    in null, 1
+    set x, 13
+    jmp wait_fall

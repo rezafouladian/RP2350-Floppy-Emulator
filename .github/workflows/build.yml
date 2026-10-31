@@ -1,0 +1,105 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  RUST_VERSION: 1.88.0
+
+jobs:
+  test:
+    name: Host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update && rustup default "$RUST_VERSION"
+      - name: Run every host test
+        run: |
+          set -e
+          mkdir -p target
+          for t in track_check write_check dc42_check config_check knob_check flux_check \
+                   weak_check sp_check dcd_check a2_check a2r_check; do
+            echo "::group::$t"
+            rustc --edition 2024 -O -A dead_code "tests/host/$t.rs" -o "target/$t"
+            "target/$t"
+            echo "::endgroup::"
+          done
+      - name: Build the host tools
+        run: |
+          set -e
+          for t in a2emu disk_scan make_images bench_images bench_table prodos; do
+            rustc --edition 2024 -O -A dead_code "tools/$t.rs" -o "target/$t"
+          done
+
+  firmware:
+    name: Firmware (.uf2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update --target thumbv8m.main-none-eabihf && rustup default "$RUST_VERSION"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked
+      - name: Make the UF2
+        run: |
+          rustc --edition 2024 -O tools/elf2uf2.rs -o target/elf2uf2
+          target/elf2uf2 target/thumbv8m.main-none-eabihf/release/rp2350-floppy-emulator rp2350-floppy-emulator.uf2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rp2350-floppy-emulator-uf2
+          path: rp2350-floppy-emulator.uf2
+          if-no-files-found: error
+
+  floppybench:
+    name: FloppyBench.dsk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Retro68's prebuilt image, so the 68k toolchain isn't built here.
+      - name: Build with Retro68
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src/tools/floppybench ghcr.io/autc04/retro68 bash -c '
+            set -e
+            cmake -B build -DCMAKE_TOOLCHAIN_FILE=/Retro68-build/toolchain/m68k-apple-macos/cmake/retro68.toolchain.cmake
+            cmake --build build
+            chmod -R a+rwX build'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FloppyBench
+          path: tools/floppybench/build/FloppyBench.dsk
+          if-no-files-found: error
+
+  a2bench:
+    name: A2Bench disks
+    runs-on: ubuntu-latest
+    env:
+      # Optional: a URL for a bootable ProDOS 8 disk image (a repository variable). A2BENCH140.po
+      # takes its boot blocks and PRODOS file from it; without it only A2BENCH.po is built.
+      PRODOS_BOOT_URL: ${{ vars.PRODOS_BOOT_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update && rustup default "$RUST_VERSION"
+      - name: Install cc65
+        run: sudo apt-get update && sudo apt-get install -y cc65
+      - name: Build
+        working-directory: tools/a2bench
+        run: |
+          if [ -n "$PRODOS_BOOT_URL" ]; then
+            curl -fsSL "$PRODOS_BOOT_URL" -o "$RUNNER_TEMP/boot.po"
+            make BOOT="$RUNNER_TEMP/boot.po"
+          else
+            echo "::warning::PRODOS_BOOT_URL is not set: building A2BENCH.po only, not A2BENCH140.po"
+            make
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: A2Bench
+          path: |
+            tools/a2bench/build/A2BENCH.po
+            tools/a2bench/build/A2BENCH140.po
+          if-no-files-found: error
