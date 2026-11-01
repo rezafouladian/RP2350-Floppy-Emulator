@@ -19,6 +19,9 @@
 //!   (`diskcopy`) and `.2mg` (`two_mg`).
 //! - Apple II 5.25" (`a2_track`, `dos33_image`, `prodos_image`, `woz525`): DOS 3.3 with its VTOC
 //!   and catalog chain, ProDOS with its volume directory, 6-and-2.
+//! - DOS 3.2 (`a2_track13`, `dos32_image`, `woz525_13`; `dos32_track`, `dos32_woz`): 13 sectors,
+//!   5-and-3, 9-cell syncs; `dos32_track` as real disks read from flux, every data field
+//!   rewritten in place (its splices out of step with the old syncs, its epilogue cut short).
 //!
 //! The Mac's 6-and-2 sector body and address field are `gcr`'s (`track_check` checks them against
 //! reference vectors); everything else here is written independently of the firmware.
@@ -68,6 +71,14 @@ impl Cells {
         for _ in 0..n {
             self.nib(0, 0xFF);
             self.zeros(2);
+        }
+    }
+
+    /// `n` 9-bit self-sync `FF`s, as 13-sector disks have them (never two 0s in a row).
+    pub fn sync9(&mut self, n: usize) {
+        for _ in 0..n {
+            self.nib(0, 0xFF);
+            self.zeros(1);
         }
     }
 
@@ -879,6 +890,191 @@ pub fn a2_track(track: u8, volume: u8, cells: usize, sector: impl Fn(u8) -> [u8;
     let left = cells - c.len();
     c.fill(0xFF, left);
     c.0
+}
+
+/// 5-and-3's 32 disk nibbles
+pub const DISK_BYTES_53: [u8; 32] = [
+    0xab, 0xad, 0xae, 0xaf, 0xb5, 0xb6, 0xb7, 0xba, 0xbb, 0xbd, 0xbe, 0xbf, 0xd6, 0xd7, 0xda, 0xdb,
+    0xdd, 0xde, 0xdf, 0xea, 0xeb, 0xed, 0xee, 0xef, 0xf5, 0xf6, 0xf7, 0xfa, 0xfb, 0xfd, 0xfe, 0xff,
+];
+
+/// 5-and-3
+pub fn encode53(src: &[u8; 256]) -> [u8; 411] {
+    const CHUNK: usize = 0x33;
+    let mut top = [0u8; CHUNK * 5 + 1];
+    let mut threes = [0u8; CHUNK * 3 + 1];
+    let mut p = 0;
+    let mut chunk = CHUNK as isize - 1;
+    let mut i = 0;
+    while i < top.len() - 1 {
+        let (t1, t2, t3, t4, t5) = (src[p], src[p + 1], src[p + 2], src[p + 3], src[p + 4]);
+        p += 5;
+        let c = chunk as usize;
+        top[c] = t1 >> 3;
+        top[c + CHUNK] = t2 >> 3;
+        top[c + CHUNK * 2] = t3 >> 3;
+        top[c + CHUNK * 3] = t4 >> 3;
+        top[c + CHUNK * 4] = t5 >> 3;
+        threes[c] = (t1 & 0x07) << 2 | (t4 & 0x04) >> 1 | (t5 & 0x04) >> 2;
+        threes[c + CHUNK] = (t2 & 0x07) << 2 | (t4 & 0x02) | (t5 & 0x02) >> 1;
+        threes[c + CHUNK * 2] = (t3 & 0x07) << 2 | (t4 & 0x01) << 1 | (t5 & 0x01);
+        chunk -= 1;
+        i += 5;
+    }
+    assert_eq!(chunk, -1);
+    top[255] = src[p] >> 3;
+    threes[CHUNK * 3] = src[p] & 0x07;
+    let mut out = [0u8; 411];
+    let mut k = 0;
+    let mut chksum = 0u8;
+    for i in (0..threes.len()).rev() {
+        out[k] = DISK_BYTES_53[(threes[i] ^ chksum) as usize];
+        k += 1;
+        chksum = threes[i];
+    }
+    for &t in &top {
+        out[k] = DISK_BYTES_53[(t ^ chksum) as usize];
+        k += 1;
+        chksum = t;
+    }
+    out[k] = DISK_BYTES_53[chksum as usize];
+    out
+}
+
+/// DOS 3.2's sector numbers around a track, as its formatter writes them (10 apart, modulo 13).
+pub const DOS32_SKEW: [u8; 13] = [0, 10, 7, 4, 1, 11, 8, 5, 2, 12, 9, 6, 3];
+
+/// A 13-sector track, `cells` long: 40 9-bit syncs, then the sectors in DOS 3.2's skew, each
+/// its address field (`D5 AA B5`), 6 syncs, data field (5-and-3) and 14 syncs; the rest `FF`s.
+pub fn a2_track13(track: u8, volume: u8, cells: usize, sector: impl Fn(u8) -> [u8; 256]) -> Vec<bool> {
+    let mut c = Cells::default();
+    c.sync9(40);
+    for &s in &DOS32_SKEW {
+        c.nibs(&[0xD5, 0xAA, 0xB5]);
+        for b in [volume, track, s, volume ^ track ^ s] {
+            c.nibs(&four_and_four(b));
+        }
+        c.nibs(&[0xDE, 0xAA, 0xEB]);
+        c.sync9(6);
+        c.nibs(&[0xD5, 0xAA, 0xAD]);
+        c.nibs(&encode53(&sector(s)));
+        c.nibs(&[0xDE, 0xAA, 0xEB]);
+        c.sync9(14);
+    }
+    let left = cells - c.len();
+    c.fill(0xFF, left);
+    c.0
+}
+
+/// A DOS 3.2 track as real ones read (from flux: System Masters), for sectors `sector(s)` by number:
+/// - formatted: gaps of 32–37 9-cell syncs, address fields, 13 syncs, data fields; the rest of
+///   the revolution (30–60 syncs) at the wrap;
+/// - every data field then rewritten by DOS 3.2's WRITE: its gate opens 1–8 cells into the second
+///   sync after the address field, so its 12 syncs are out of step with the old ones (a stray
+///   nibble at the splice, then up to 7 before the reader is back in step: `8B DF EF F7 FB FD
+///   FE`), and closes 3–5 cells into the epilogue's `EB` (read as `EC`, `F0`, `F4`…), the old
+///   syncs after it out of step again;
+/// - `damaged`: that sector's data field was never rewritten and its data mark reads `D5 AB AD`
+///   (the System Master's track 2 sector 12 has a damaged one);
+/// - the track starts at any cell (no cross-track sync), and its length follows from its gaps
+///   (~50,800 cells: the disks' are 50,600–51,200 at 3.9 µs).
+pub fn dos32_track(track: u8, volume: u8, damaged: Option<u8>, seed: u64, sector: impl Fn(u8) -> [u8; 256]) -> Vec<bool> {
+    let mut s = seed | 1;
+    let mut c = Cells::default();
+    let mut writes = vec![];
+    for &sec in &DOS32_SKEW {
+        c.sync9(32 + rng(&mut s) as usize % 6);
+        c.nibs(&[0xD5, 0xAA, 0xB5]);
+        for b in [volume, track, sec, volume ^ track ^ sec] {
+            c.nibs(&four_and_four(b));
+        }
+        c.nibs(&[0xDE, 0xAA, 0xEB]);
+        let header_end = c.len();
+        c.sync9(13);
+        c.nibs(&[0xD5, if damaged == Some(sec) { 0xAB } else { 0xAA }, 0xAD]);
+        let old: [u8; 256] = core::array::from_fn(|_| rng(&mut s) as u8);
+        c.nibs(&encode53(&old));
+        c.nibs(&[0xDE, 0xAA, 0xEB]);
+        if damaged != Some(sec) {
+            writes.push((header_end + 9 + 1 + rng(&mut s) as usize % 8, sec));
+        }
+    }
+    c.sync9(30 + rng(&mut s) as usize % 31);
+    for (at, sec) in writes {
+        let mut w = Cells::default();
+        w.sync9(12);
+        w.nibs(&[0xD5, 0xAA, 0xAD]);
+        w.nibs(&encode53(&sector(sec)));
+        w.nibs(&[0xDE, 0xAA]);
+        w.nib(0, 0xEB);
+        w.0.truncate(w.len() - 8 + 3 + rng(&mut s) as usize % 3);
+        c.0[at..at + w.len()].copy_from_slice(&w.0);
+    }
+    let n = c.len();
+    c.0.rotate_left(rng(&mut s) as usize % n);
+    c.0
+}
+
+/// A 5.25" WOZ 2 of a `.d13` image whose tracks are [`dos32_track`]s (volume 254, each its own
+/// length; `damaged`: a (track, sector) whose data mark is damaged), heard at its quarter track
+/// and one either side, not synchronized.
+pub fn dos32_woz(img: &[u8], damaged: Option<(u8, u8)>) -> Vec<u8> {
+    let mut map = [0xFFu8; 160];
+    let mut trks = vec![];
+    for t in 0..35u8 {
+        let sector = |s: u8| img[(t as usize * 13 + s as usize) * 256..][..256].try_into().unwrap();
+        let bad = damaged.filter(|d| d.0 == t).map(|d| d.1);
+        trks.push(Trk::Bits(dos32_track(t, 254, bad, 0xD032_0000 + u64::from(t), sector)));
+        for q in [4 * t as i32 - 1, 4 * t as i32, 4 * t as i32 + 1] {
+            if q >= 0 {
+                map[q as usize] = t;
+            }
+        }
+    }
+    container(Kind::Woz525(32), false, false, &map, &trks)
+}
+
+/// A DOS 3.2 disk (`.d13`, 35 tracks of 13 sectors by number): random sectors, a VTOC at track 17
+/// sector 0 and the catalog down track 17 from sector 12, each linking to the one below.
+pub fn dos32_image() -> Vec<u8> {
+    let mut d = random_bytes(116_480, 0xD032);
+    let at = |t: usize, s: usize| (t * 13 + s) * 256;
+    let v = at(17, 0);
+    d[v..v + 256].fill(0);
+    d[v + 1] = 17;
+    d[v + 2] = 12;
+    d[v + 3] = 2;
+    d[v + 6] = 254;
+    d[v + 0x27] = 122;
+    d[v + 0x34] = 35;
+    d[v + 0x35] = 13;
+    d[v + 0x37] = 1;
+    for s in 1..13 {
+        let c = at(17, s);
+        d[c..c + 256].fill(0);
+        if s > 1 {
+            d[c + 1] = 17;
+            d[c + 2] = s as u8 - 1;
+        }
+    }
+    d
+}
+
+/// A 5.25" WOZ 2 of a `.d13` image, every track `cells` long, heard at its quarter track and one
+/// either side.
+pub fn woz525_13(img: &[u8], cells: usize) -> Vec<u8> {
+    let mut map = [0xFFu8; 160];
+    let mut trks = vec![];
+    for t in 0..35u8 {
+        let sector = |s: u8| img[(t as usize * 13 + s as usize) * 256..][..256].try_into().unwrap();
+        trks.push(Trk::Bits(a2_track13(t, 254, cells, sector)));
+        for q in [4 * t as i32 - 1, 4 * t as i32, 4 * t as i32 + 1] {
+            if q >= 0 {
+                map[q as usize] = t;
+            }
+        }
+    }
+    container(Kind::Woz525(32), false, false, &map, &trks)
 }
 
 /// DOS 3.3's logical sector at each physical one is the inverse of this: the physical sector of

@@ -8,7 +8,9 @@
 //! - MOOF: side `s`'s track data at `s * MAX_TRACK_BLOCKS`, as stored in the file; a flux track
 //!   is converted to cells on the way in, so it's held like a bitstream track;
 //! - Apple II: one track (one side). A sector image's track is 8 blocks of two 256-byte sectors
-//!   each, in the file's order (`a2::file_sector`), and the track as it plays, in cells, at
+//!   each, in the file's order (`a2::file_sector`); a 13-sector (`.d13`) track's 6.5 blocks are
+//!   read whole from the block it starts in, its sectors from byte 0 or 256 of the first
+//!   ([`a2_slot`]); and the track as it plays, in cells, at
 //!   [`A2_CELLS`] (writes go into those, and the sectors are decoded back out); a `.nib` track 13
 //!   blocks of nibbles; a WOZ track its data as stored (a WOZ 1 record is read 256 bytes in, so it
 //!   starts at block 0 too). The track is a key from `Disk::a2_track`, not the head's quarter
@@ -269,6 +271,11 @@ impl<'a, D: BlockDevice> Cylinder<'a, D> {
                     }
                 }
             }
+            Disk::A2 { order: a2::Order::Dos32, .. } if track != a2::BLANK => {
+                // Whole blocks: an odd track starts halfway into one (`a2_slot`).
+                let (first, n) = self.sector_range(track);
+                read_blocks(self.card, self.map, first, &mut self.blocks[..n])?;
+            }
             Disk::A2 { offset, .. } | Disk::Nib { offset, .. } if track != a2::BLANK => {
                 let (at, bytes) = self.a2_track_bytes(track, *offset);
                 self.read_sectors(at / BLOCK, bytes / BLOCK, at % BLOCK)?;
@@ -296,8 +303,21 @@ impl<'a, D: BlockDevice> Cylinder<'a, D> {
     /// Where Apple II track `track` of a sector or `.nib` image is in the file, starting `offset`
     /// bytes in: its first byte and its length.
     fn a2_track_bytes(&self, track: u8, offset: u16) -> (usize, usize) {
-        let bytes = if let Disk::Nib { .. } = self.disk { a2::NIB_TRACK_BYTES } else { a2::TRACK_BYTES };
+        let bytes = match self.disk {
+            Disk::Nib { .. } => a2::NIB_TRACK_BYTES,
+            Disk::A2 { order, .. } => order.encoding().track_bytes(),
+            _ => a2::TRACK_BYTES,
+        };
         (offset as usize + track as usize * bytes, bytes)
+    }
+
+    /// Where a sector image's track starts in `blocks[0]`: 256 for a 13-sector track that starts
+    /// halfway into a block (read whole, not shifted), else 0.
+    fn a2_base(&self, track: u8) -> usize {
+        match self.disk {
+            Disk::A2 { order: a2::Order::Dos32, offset, .. } => self.a2_track_bytes(track, *offset).0 % BLOCK,
+            _ => 0,
+        }
     }
 
     /// Read image sectors `first..first + n` into `blocks`. With an `offset` (DiskCopy), sector `i`
@@ -500,6 +520,7 @@ impl<'a, D: BlockDevice> Cylinder<'a, D> {
                 const { assert!(A2_CELLS >= 9 && A2_CELLS + A2_CELL_BLOCKS <= STAGE) };
                 let buf = &mut bufs[0];
                 let words = a2::TRACK_CELLS / 32;
+                let base = self.a2_base(track);
                 let (sectors, cells) = self.blocks.split_at_mut(A2_CELLS);
                 let cells = &mut cells[..A2_CELL_BLOCKS];
                 if self.a2_cells {
@@ -509,11 +530,12 @@ impl<'a, D: BlockDevice> Cylinder<'a, D> {
                     }
                 } else {
                     a2::build_track(
+                        order.encoding(),
                         track,
                         *volume,
                         |p| {
-                            let f = a2::file_sector(*order, p);
-                            sectors[f / 2].contents[f % 2 * a2::SECTOR_BYTES..][..a2::SECTOR_BYTES].try_into().unwrap()
+                            let (b, at) = a2_slot(base, a2::file_sector(*order, p));
+                            sectors[b].contents[at..][..a2::SECTOR_BYTES].try_into().unwrap()
                         },
                         buf,
                     );
@@ -714,20 +736,24 @@ impl<'a, D: BlockDevice> Cylinder<'a, D> {
             return 0;
         };
         self.a2_settle = false;
+        let (enc, base) = (order.encoding(), self.a2_base(track));
         let (sectors, held) = self.blocks.split_at_mut(A2_CELLS);
         let mut unused = 0;
         let cells_held = StoredSide { blocks: &mut held[..A2_CELL_BLOCKS], bits: a2::TRACK_CELLS, first: 0, dirty: &mut unused };
         let (dirty, mut changed) = (&mut self.dirty, 0);
-        writes::a2_fields(&cells_held, a2::TRACK_CELLS + A2_DECODE_EXTRA, |address, data| {
+        // Only the image's own kind of sector fits it (DOS 3.3 formatting a 13-sector image's
+        // track plays until it's next read, but can't be saved).
+        writes::a2_fields(&cells_held, a2::TRACK_CELLS + A2_DECODE_EXTRA, enc, |address, kind, data| {
             if let Some((t, s)) = address
                 && t == track
-                && s < a2::SECTORS
+                && kind == enc
+                && s < enc.sectors()
             {
-                let f = a2::file_sector(*order, s);
-                let sector = &mut sectors[f / 2].contents[f % 2 * a2::SECTOR_BYTES..][..a2::SECTOR_BYTES];
+                let (b, at) = a2_slot(base, a2::file_sector(*order, s));
+                let sector = &mut sectors[b].contents[at..][..a2::SECTOR_BYTES];
                 if sector != data {
                     sector.copy_from_slice(data);
-                    *dirty |= 1 << (f / 2);
+                    *dirty |= 1 << b;
                     changed += 1;
                 }
             }
@@ -831,6 +857,10 @@ impl<'a, D: BlockDevice> Cylinder<'a, D> {
                 (first, gcr::sectors_per_track(track) as usize * *sides as usize)
             }
             Disk::Mfm { format, .. } => (format.first_block(track, 0), 2 * format.sectors() as usize),
+            Disk::A2 { order: a2::Order::Dos32, offset, .. } => {
+                let (at, bytes) = self.a2_track_bytes(track, *offset);
+                (at / BLOCK, (at % BLOCK + bytes).div_ceil(BLOCK))
+            }
             Disk::A2 { offset, .. } | Disk::Nib { offset, .. } => {
                 let (at, bytes) = self.a2_track_bytes(track, *offset);
                 (at / BLOCK, bytes / BLOCK)
@@ -928,22 +958,32 @@ fn reformat(m: &Moof, track: u8, side: u8, cells: &RingCells, len: usize, stored
 }
 
 /// Decode the sectors of an Apple II format capture and re-encode them into `stored`'s fixed
-/// length (a WOZ track's), on the track its address fields name.
+/// length (a WOZ track's), on the track its address fields name, 16 or 13 sectors as they are.
 fn a2_reformat(cells: &RingCells, len: usize, stored: &mut StoredSide, scratch: &mut TrackBuf) -> Result<(), &'static str> {
     let mut sectors = [[0u8; a2::SECTOR_BYTES]; a2::SECTORS as usize];
-    let mut track = None;
-    writes::a2_fields(cells, len, |address, d| {
+    // The track and encoding (16 or 13 sectors) of the first address field.
+    let mut first = None;
+    writes::a2_fields(cells, len, a2::Encoding::SixAndTwo, |address, enc, d| {
         if let Some((t, s)) = address
-            && s < a2::SECTORS
-            && *track.get_or_insert(t) == t
+            && s < enc.sectors()
+            && *first.get_or_insert((t, enc)) == (t, enc)
         {
             sectors[s as usize] = *d;
         }
     });
-    let track = track.ok_or("write: format with no sectors")?;
-    a2::build_track_cells(track, a2::VOLUME, |s| &sectors[s as usize], stored.bits, scratch).ok_or("write: format doesn't fit the WOZ track")?;
+    let (track, enc) = first.ok_or("write: format with no sectors")?;
+    a2::build_track_cells(enc, track, a2::VOLUME, |s| &sectors[s as usize], stored.bits, scratch)
+        .ok_or("write: format doesn't fit the WOZ track")?;
     writes::copy_track(stored, scratch);
     Ok(())
+}
+
+/// Where sector slot `f` of a sector image's track is in `blocks`, the track starting `base` bytes
+/// into the first (0, or 256 for a 13-sector track: a sector never straddles two blocks): the
+/// block and the byte in it.
+fn a2_slot(base: usize, f: usize) -> (usize, usize) {
+    let at = base + f * a2::SECTOR_BYTES;
+    (at / BLOCK, at % BLOCK)
 }
 
 /// Write `blocks` to file blocks `first..first + blocks.len()`, one multi-block write per run of

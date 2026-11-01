@@ -52,6 +52,7 @@ Modes:
 
 5.25" Disks:
 - DOS 3.3 order (.dsk, .do, read and write)
+- DOS 3.2 13-sector (.d13, .dsk, .do, read and write)
 - ProDOS order (.po, .dsk, read and write)
 - 2MG (.2mg, read and write)
 - NIB (.nib, read-only)

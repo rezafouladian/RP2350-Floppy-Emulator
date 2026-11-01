@@ -411,8 +411,8 @@ impl<F: Fn(usize) -> u8> Stream<F> {
 }
 
 /// Where the loop should wrap: the middle of the longest gap from a data field's trailer
-/// (`DE AA` after a `D5 AA AD` data mark) to the next address mark (`D5 AA 96`), as an IWM would
-/// frame the bits. Runs the framer over two revolutions so a gap across the wrap counts too. A
+/// (`DE AA` after a `D5 AA AD` data mark) to the next address mark (`D5 AA 96`, or `D5 AA B5`
+/// on a 13-sector Apple II track), as an IWM would frame the bits. Runs the framer over two revolutions so a gap across the wrap counts too. A
 /// track with no such gap wraps in the middle of its longest run of `FF` nibbles, or at 0.
 ///
 /// The padding at the wrap and every stream restart land here, so it must be filler. Only a data
@@ -450,7 +450,8 @@ pub fn find_rotation(byte: impl Fn(usize) -> u8, bits: u32) -> u32 {
         } else if recent & 0xFFFF == 0xDEAA && in_data {
             in_data = false;
             trailer_end = Some(i + 1);
-        } else if recent & 0xFF_FFFF == 0xD5_AA96 {
+        } else if matches!(recent & 0xFF_FFFF, 0xD5_AA96 | 0xD5_AAB5) {
+            // An address mark (`D5 AA B5`: a 13-sector Apple II track's).
             in_data = false;
             let mark_start = i + 1 - 24;
             // A gap ending in the second revolution has been seen whole.

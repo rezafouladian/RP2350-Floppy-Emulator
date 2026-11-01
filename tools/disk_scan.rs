@@ -363,6 +363,9 @@ fn decode(rev: &Rev, r62: &[u8; 256], r53: &[u8; 256]) -> Track {
     let b: Vec<u8> = n.iter().map(|&(b, _)| b).collect();
     let in_first = |i: usize| n[i].1 < len;
     let mut syncs = 0;
+    // The kind of the last address field: its data field is the same kind. A 5-and-3 field's
+    // nibbles are all 6-and-2 ones too, and its first 343 pass a 6-and-2 checksum one time in 64.
+    let mut last13 = false;
     for i in 0..b.len() {
         if b[i] == 0xFF {
             syncs += 1;
@@ -384,6 +387,7 @@ fn decode(rev: &Rev, r62: &[u8; 256], r53: &[u8; 256]) -> Track {
                 continue;
             }
             if c == 0x96 { t.addr16 += 1 } else { t.addr13 += 1 }
+            last13 = c == 0xB5;
             *t.tracks.entry(trk).or_default() += 1;
             *t.volumes.entry(vol).or_default() += 1;
             if sec < 32 {
@@ -408,6 +412,7 @@ fn decode(rev: &Rev, r62: &[u8; 256], r53: &[u8; 256]) -> Track {
             };
             let (ok62, ok53) = (field(343, r62), field(411, r53));
             let (ok, count) = match (ok62, ok53) {
+                (_, Some(true)) if last13 => (true, 411),
                 (Some(true), _) => (true, 343),
                 (_, Some(true)) => (true, 411),
                 _ => (false, 343),

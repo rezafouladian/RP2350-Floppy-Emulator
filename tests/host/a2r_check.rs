@@ -3,13 +3,15 @@
 //! both go through (`moof::FluxCells` at the cell `moof::measure_cell` finds), and each track's
 //! own cell rate (`woz::track_hz`).
 //!
-//! The disks are made here: DOS 3.3 tracks of random sectors (`a2::build_track`), turned into
-//! flux as a drive a little off speed with some jitter would capture them, from a random angle
-//! and over 1.6 revolutions, written as A2R 1, 2 and 3 (also a solved A2R 3 track) and as a WOZ
-//! 2.1 with FLUX tracks. Each is read back as the firmware does (`Cylinder::read_a2r`,
+//! The disks are made here: DOS 3.3 tracks of random sectors (`a2::build_track`), and DOS 3.2
+//! ones as real disks read (`disks::dos32_track`: every data field rewritten in place), turned
+//! into flux as a drive a little off speed with some jitter would capture them, from a random
+//! angle and over 1.6 revolutions, written as A2R 1, 2 and 3 (also a solved A2R 3 track) and as
+//! a WOZ 2.1 with FLUX tracks. Each is read back as the firmware does (`Cylinder::read_a2r`,
 //! `read_flux_bytes`): every track must loop at exactly its cells and decode whole, through the
-//! wrap. If `images/Applesauce` is there, some of its real A2Rs are read too: a looped
-//! track must hold every sector a straight decode of its capture finds.
+//! wrap. If `A2R_DIR` names a folder of real A2Rs (one folder per disk), some of them are read
+//! too: a looped track must hold every sector (16 or 13) a straight decode of its
+//! capture finds.
 //!
 //! Run from the repo root:
 //!   rustc --edition 2024 -O -A dead_code tests/host/a2r_check.rs -o target/a2r_check && target/a2r_check
@@ -19,6 +21,7 @@ mod a2;
 mod a2_decode;
 #[path = "../../src/a2r.rs"]
 mod a2r;
+mod disks;
 #[path = "../../src/gcr.rs"]
 mod gcr;
 #[path = "../../src/mfm.rs"]
@@ -32,7 +35,7 @@ mod weak;
 #[path = "../../src/woz.rs"]
 mod woz;
 
-use a2_decode::decode_track;
+use a2_decode::{decode_track, decode_track13};
 use track::*;
 
 /// `Cylinder`'s `A2R_START`.
@@ -49,8 +52,16 @@ fn rng(s: &mut u64) -> u64 {
 fn random_track(track: u8, s: &mut u64) -> (Vec<bool>, Vec<[u8; 256]>) {
     let sectors: Vec<[u8; 256]> = (0..16).map(|_| core::array::from_fn(|_| rng(s) as u8)).collect();
     let mut buf: TrackBuf = [0; MAX_TRACK_WORDS];
-    a2::build_track(track, 254, |p| &sectors[p as usize], &mut buf);
+    a2::build_track(a2::Encoding::SixAndTwo, track, 254, |p| &sectors[p as usize], &mut buf);
     let cells = (0..a2::TRACK_CELLS).map(|i| buf[i / 32] >> (31 - i % 32) & 1 != 0).collect();
+    (cells, sectors)
+}
+
+/// A DOS 3.2 track of random sectors as real disks read (`disks::dos32_track`): its cells, and
+/// its sectors (by number).
+fn random_track13(track: u8, s: &mut u64) -> (Vec<bool>, Vec<[u8; 256]>) {
+    let sectors: Vec<[u8; 256]> = (0..13).map(|_| core::array::from_fn(|_| rng(s) as u8)).collect();
+    let cells = disks::dos32_track(track, 254, None, rng(s), |k| sectors[k as usize]);
     (cells, sectors)
 }
 
@@ -158,15 +169,19 @@ struct Disk {
 }
 
 fn make_disk(tracks: u8, s: &mut u64) -> Disk {
+    make_disk_of(tracks, random_track, s)
+}
+
+fn make_disk_of(tracks: u8, track: fn(u8, &mut u64) -> (Vec<bool>, Vec<[u8; 256]>), s: &mut u64) -> Disk {
     let mut d = Disk { tracks: vec![], speed: vec![], from: vec![] };
     for t in 0..tracks {
-        d.tracks.push(random_track(t, s));
+        d.tracks.push(track(t, s));
         // Ticks a cell: the capturing drive off speed and the track's writer apart from it, up to
         // 2% between them, differing by track. (With every track at 51,136 cells this stands for
         // both; the capturing drive alone decides how far 200 ms is from a revolution, which a
         // capture with no loop point goes on.)
         d.speed.push(32.0 * (1.0 + ((rng(s) % 401) as f64 - 200.0) / 10_000.0));
-        d.from.push(rng(s) as usize % a2::TRACK_CELLS);
+        d.from.push(rng(s) as usize % d.tracks[t as usize].0.len());
     }
     d
 }
@@ -302,11 +317,12 @@ fn check_a2r(name: &str, file: &[u8], d: &Disk, solved: Option<usize>) {
                 let rev = revolution(&r, file, q as u8);
                 let what = if Some(t) == solved && q == 4 * t { "solved" } else { "capture" };
                 assert_eq!(rev.len(), cells.len(), "{name}: track {t} (quarter {q}, {what}) loops at its cells");
-                let found = decode_track(&rev);
-                assert_eq!(found.len(), 16, "{name}: track {t} (quarter {q}): all 16 sectors through the wrap");
+                let found = if sectors.len() == 13 { decode_track13(&rev) } else { decode_track(&rev) };
+                assert_eq!(found.len(), sectors.len(), "{name}: track {t} (quarter {q}): all {} sectors through the wrap", sectors.len());
                 for (trk, sec, _, data) in found {
                     assert_eq!(trk as usize, t);
-                    // Physical sector `sec` is `sectors[sec]` (`a2::build_track`'s order).
+                    // Sector `sec` is `sectors[sec]` (`a2::build_track`'s physical order, or a
+                    // 13-sector track's numbers).
                     assert_eq!(&data, &sectors[sec as usize], "{name}: track {t} sector {sec}");
                 }
             }
@@ -322,6 +338,9 @@ fn check_synthetic() {
     check_a2r("A2R 2", &a2r2_file(&d, &mut s), &d, None);
     check_a2r("A2R 1", &a2r1_file(&d, &mut s), &d, None);
     check_a2r("A2R 3 (62.5 ns, a solved track)", &a2r3_file(&d, 2, &mut s), &d, Some(2));
+    let d13 = make_disk_of(6, random_track13, &mut s);
+    check_a2r("A2R 1 of DOS 3.2 tracks as real disks read", &a2r1_file(&d13, &mut s), &d13, None);
+    check_a2r("A2R 3 of DOS 3.2 tracks (a solved track)", &a2r3_file(&d13, 4, &mut s), &d13, Some(4));
     // Refused: a 3.5" A2R, an early A2R 1, a truncated file.
     let mut f = a2r2_file(&d, &mut s);
     f[8 + 8 + 33] = 2;
@@ -432,15 +451,24 @@ fn check_track_hz() {
 /// Real A2Rs: every whole-track capture's revolution must hold each sector a straight decode of
 /// the capture finds (the loop loses nothing at the wrap).
 fn check_real() {
-    let root = std::path::Path::new("images/Applesauce");
-    let Ok(rd) = std::fs::read_dir(root) else {
-        println!("real A2Rs: images/Applesauce not found, skipped");
+    let Ok(dir) = std::env::var("A2R_DIR") else {
+        println!("real A2Rs: A2R_DIR not set, skipped");
         return;
     };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        println!("real A2Rs: {dir} not found, skipped");
+        return;
+    };
+    // Every sector, 16 or 13 (keyed by kind and number).
+    let decode = |cells: &[bool]| -> std::collections::BTreeSet<(bool, u8)> {
+        let six = decode_track(cells).into_iter().map(|f| (false, f.1));
+        six.chain(decode_track13(cells).into_iter().map(|f| (true, f.1))).collect()
+    };
+    let step = std::env::var("A2R_STEP").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
     let mut files: Vec<_> = rd.filter_map(|e| e.ok()).flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten()).filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "a2r")).collect();
     files.sort();
-    let (mut disks, mut tracks, mut lost, mut sectors, mut loops) = (0, 0, 0, 0, vec![]);
-    for p in files.iter().step_by(60) {
+    let (mut disks, mut tracks, mut lost, mut sectors, mut loops, mut thirteen) = (0, 0, 0, 0, vec![], 0);
+    for p in files.iter().step_by(step) {
         let p_show = p.clone();
         let file = std::fs::read(p).unwrap();
         let Ok(r) = index(&file, BLOCK) else { continue };
@@ -456,12 +484,13 @@ fn check_real() {
             if START + p + 3_000 > cells.len() {
                 continue;
             }
-            let straight: std::collections::BTreeSet<u8> = decode_track(&cells[START..START + p + 3_000]).iter().map(|f| f.1).collect();
+            let straight = decode(&cells[START..START + p + 3_000]);
             if straight.is_empty() {
                 continue;
             }
-            let looped: std::collections::BTreeSet<u8> = decode_track(&rev).iter().map(|f| f.1).collect();
+            let looped = decode(&rev);
             tracks += 1;
+            thirteen += straight.iter().any(|f| f.0) as usize;
             sectors += straight.len();
             let missing = straight.difference(&looped).count();
             lost += missing;
@@ -483,7 +512,7 @@ fn check_real() {
     let far = loops.iter().filter(|x| x.abs() > 2.5).count();
     println!("real A2Rs: {far} of {} loops more than 2.5% from the loop point", loops.len());
     println!(
-        "real A2Rs: {disks} disks, {tracks} tracks with sectors: {lost} of {sectors} sectors lost at the wrap; loop vs the loop point median {:+.3}%, worst {:.2}%",
+        "real A2Rs: {disks} disks, {tracks} tracks with sectors ({thirteen} of 13): {lost} of {sectors} sectors lost at the wrap; loop vs the loop point median {:+.3}%, worst {:.2}%",
         loops.get(loops.len() / 2).copied().unwrap_or(0.0),
         worst
     );

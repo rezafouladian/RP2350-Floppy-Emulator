@@ -9,8 +9,9 @@
 //!   track re-encoded to fit (`gcr::build_track_cells`, `mfm::build_track_cells`).
 //! - Apple II 5.25" sector images are held as cells while a track is loaded, and every write is
 //!   laid into them where it was made ([`splice_a2`]); the sectors are then decoded from the track
-//!   ([`a2_fields`]). DOS 3.3 formats a track a field at a time and reads it back expecting its
-//!   own layout, so it can't be re-encoded.
+//!   ([`a2_fields`]). DOS 3.3 formats a track a field at a time and reads it back expecting
+//!   its own layout, so it can't be re-encoded. 13-sector (DOS 3.2) tracks are the same with
+//!   `D5 AA B5` address marks and 5-and-3 data fields.
 
 use crate::{a2, gcr};
 use crate::mfm;
@@ -52,6 +53,14 @@ fn frame(bits: impl Fn(usize) -> bool, range: core::ops::Range<usize>, mut f: im
 
 const DATA_MARK: u32 = 0xD5_AAAD;
 const ADDRESS_MARK: u32 = 0xD5_AA96;
+/// DOS 3.2's address mark (13 sectors, 5-and-3).
+const ADDRESS_MARK_13: u32 = 0xD5_AAB5;
+
+/// The last three nibbles are an address mark: the Mac's and DOS 3.3's, or DOS 3.2's. (`D5` is
+/// no data nibble on the Mac, so `D5 AA B5` is never found in its tracks.)
+fn is_address_mark(recent: u32) -> bool {
+    matches!(recent & 0xFF_FFFF, ADDRESS_MARK | ADDRESS_MARK_13)
+}
 
 /// Every intact GCR data field in `len` cells: `f(sector, tags + data)`. The sector number comes
 /// from the data field itself.
@@ -80,10 +89,17 @@ pub fn gcr_data_fields(cells: &impl Cells, len: usize, mut f: impl FnMut(u8, &[u
     });
 }
 
-/// Every intact Apple II 5.25" data field in `len` cells: `f(address, data)`, where `address` is
-/// the (track, sector) of an intact address field just before it, if there is one (a track or a
-/// format has them; a sector write starts after the address field).
-pub fn a2_fields(cells: &impl Cells, len: usize, mut f: impl FnMut(Option<(u8, u8)>, &[u8; a2::SECTOR_BYTES])) {
+/// Every intact Apple II 5.25" data field in `len` cells: `f(address, encoding, data)`, where
+/// `address` is the (track, sector) of an intact address field just before it, if there is one
+/// (a track or a format has them; a sector write starts after the address field). A data field
+/// is 6-and-2 after a `D5 AA 96` address field, 5-and-3 after a `D5 AA B5`, and `default` before
+/// any (a sector write: the disk's own).
+pub fn a2_fields(
+    cells: &impl Cells,
+    len: usize,
+    default: a2::Encoding,
+    mut f: impl FnMut(Option<(u8, u8)>, a2::Encoding, &[u8; a2::SECTOR_BYTES]),
+) {
     enum Fill {
         Idle,
         Address(usize),
@@ -91,10 +107,16 @@ pub fn a2_fields(cells: &impl Cells, len: usize, mut f: impl FnMut(Option<(u8, u
     }
     let mut recent = 0u32;
     let mut fill = Fill::Idle;
+    let mut enc = default;
     let mut address = [0u8; 8];
-    let mut field = [0u8; a2::DATA_NIBBLES];
+    let mut field = [0u8; a2::DATA_NIBBLES_53];
     let mut header: Option<(u8, u8)> = None;
     frame(|i| cells.bit(i), 0..len, |n, _| {
+        // `D5` is no data or 4-and-4 nibble: a field it turns up in is broken (a leftover data
+        // mark from an earlier format, say), and it may start the next sector's address mark.
+        if n == 0xD5 {
+            fill = Fill::Idle;
+        }
         match fill {
             Fill::Address(k) => {
                 address[k] = n;
@@ -106,14 +128,24 @@ pub fn a2_fields(cells: &impl Cells, len: usize, mut f: impl FnMut(Option<(u8, u
             }
             Fill::Data(k) => {
                 field[k] = n;
-                fill = if k + 1 < field.len() { Fill::Data(k + 1) } else { Fill::Idle };
-                if k + 1 == field.len()
-                    && let Some(data) = a2::decode_data(&field)
-                {
-                    f(header.take(), &data);
+                let total = enc.data_nibbles();
+                fill = if k + 1 < total { Fill::Data(k + 1) } else { Fill::Idle };
+                if k + 1 == total {
+                    let data = match enc {
+                        a2::Encoding::SixAndTwo => a2::decode_data(field[..a2::DATA_NIBBLES].try_into().unwrap()),
+                        a2::Encoding::FiveAndThree => a2::decode_data53(&field),
+                    };
+                    if let Some(data) = data {
+                        f(header.take(), enc, &data);
+                    }
                 }
             }
-            Fill::Idle if recent & 0xFF_FFFF == ADDRESS_MARK => {
+            Fill::Idle if is_address_mark(recent) => {
+                enc = if recent & 0xFF == u32::from(a2::Encoding::FiveAndThree.address_mark()) {
+                    a2::Encoding::FiveAndThree
+                } else {
+                    a2::Encoding::SixAndTwo
+                };
                 header = None;
                 address[0] = n;
                 fill = Fill::Address(1);
@@ -207,7 +239,9 @@ const LOOK_AHEAD: usize = 256;
 
 /// Splice a GCR data-field write into a stored track. `pos` is the track cell under the head
 /// when the write gate opened. The capture's data mark (`D5 AA AD`) is laid exactly over the
-/// data mark that follows the last address field before `pos`, so the sector keeps its place.
+/// data mark that follows the last address field (`D5 AA 96`, or DOS 3.2's `D5 AA B5`) before
+/// `pos`, so the sector keeps its place. If that field's data mark is damaged (or it has none),
+/// the whole write goes where the gate opened, as on a disk, but never over the address field.
 /// Returns where the capture's first cell falls and where the write ended.
 pub fn splice_gcr(track: &mut impl CellTrack, pos: usize, cells: &impl Cells, len: usize) -> Result<(usize, usize), &'static str> {
     let mut from = None;
@@ -231,8 +265,9 @@ pub fn splice_gcr(track: &mut impl CellTrack, pos: usize, cells: &impl Cells, le
     frame(|i| track.bit((window + i) % n), 0..LOOK_BACK + LOOK_AHEAD + 2_000, |nib, first| {
         recent = recent << 8 | u32::from(nib);
         starts = [starts[1], starts[2], first];
-        if recent & 0xFF_FFFF == ADDRESS_MARK && first <= LOOK_BACK + LOOK_AHEAD {
-            header_end = Some(first + 7 * 8); // mark + 5 header nibbles + DE AA, roughly
+        if is_address_mark(recent) && first <= LOOK_BACK + LOOK_AHEAD {
+            // The mark's last nibble, 8 of 4-and-4 and the epilogue.
+            header_end = Some(first + 12 * 8);
             to = None;
             count = 0;
         } else if header_end.is_some() {
@@ -243,7 +278,15 @@ pub fn splice_gcr(track: &mut impl CellTrack, pos: usize, cells: &impl Cells, le
         }
         true
     });
-    let to = to.ok_or("write: no data field on track")?;
+    let header_end = header_end.ok_or("write: no address field on track")?;
+    let (to, from) = match to {
+        Some(to) => (to, from),
+        // No data mark to line up with, nor its sync: the whole write, from its first 1.
+        None => {
+            let first = (0..from).find(|&i| cells.bit(i)).unwrap_or(from);
+            ((LOOK_BACK + first).max(header_end), first)
+        }
+    };
     let at = (window + to) % n;
     Ok(((at + n - from % n) % n, overwrite(track, at, cells, from, written_len(cells, len))))
 }
@@ -291,6 +334,12 @@ pub fn splice_a2(
     rest: bool,
 ) -> Result<A2Write, &'static str> {
     let n = track.len();
+    // A continuation follows the last capture's trailing 0s; a fresh gate, nothing written.
+    let zeros_before = match last {
+        Some(last) if rest => (last.next + n - last.end) % n,
+        _ => usize::MAX,
+    };
+    let cells = &GateEdges { cells, len, zeros_before };
     let end = written_len(cells, len);
     if rest && let Some(last) = last {
         // The last one's trailing 0s were cells of this write, not its gate's tail.
@@ -322,7 +371,37 @@ pub fn splice_a2(
     Ok(A2Write { end, next: (at + len) % n })
 }
 
-/// An Apple II address mark (`D5 AA 96`) in the first `len` cells. The capture may start in the
+/// A capture with the Apple II's write-gate edges taken out. When write mode comes on, WR is set
+/// to a level, and the separator may take that edge for a 1, a cell or more ahead of the first
+/// sync nibble's eight 1s. With 10-cell syncs the framing falls back into step within a nibble or
+/// two; with DOS 3.2's 9-cell ones it takes up to 8 syncs, more than the 5 written before a data
+/// mark, which would be missed. Nothing an Apple II writes has 9 1s in a row and then a 0 right
+/// after 3 or more 0s (GCR has at most 2 in a row, so 3 are a gap), so such a first 1 is dropped.
+struct GateEdges<'c, C> {
+    cells: &'c C,
+    len: usize,
+    /// 0s known to come before cell 0 (a continuation's: the last capture's trailing ones).
+    zeros_before: usize,
+}
+
+impl<C: Cells> GateEdges<'_, C> {
+    fn is_edge(&self, i: usize) -> bool {
+        let c = self.cells;
+        let back = i.min(3);
+        if (i - back..i).any(|k| c.bit(k)) || back.saturating_add(self.zeros_before) < 3 {
+            return false;
+        }
+        i + 9 < self.len && (i + 1..i + 9).all(|k| c.bit(k)) && !c.bit(i + 9)
+    }
+}
+
+impl<C: Cells> Cells for GateEdges<'_, C> {
+    fn bit(&self, i: usize) -> bool {
+        self.cells.bit(i) && !self.is_edge(i)
+    }
+}
+
+/// An Apple II address mark (`D5 AA 96`, or DOS 3.2's `D5 AA B5`) in the first `len` cells. The capture may start in the
 /// middle of sync (a gate that opened before the track was playing), with too few syncs left to
 /// fall into step, so every framing is tried.
 fn has_address_mark(cells: &impl Cells, len: usize) -> bool {
@@ -330,7 +409,7 @@ fn has_address_mark(cells: &impl Cells, len: usize) -> bool {
         let (mut recent, mut found) = (0u32, false);
         frame(|i| cells.bit(i), start..len, |nib, _| {
             recent = recent << 8 | u32::from(nib);
-            found = recent & 0xFF_FFFF == ADDRESS_MARK;
+            found = is_address_mark(recent);
             !found
         });
         found

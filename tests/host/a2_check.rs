@@ -1,5 +1,5 @@
-//! Host-side check of Apple II 5.25" support: the 6-and-2 codec (`src/a2.rs`), track building
-//! from sector and `.nib` images, the stepper model, WOZ parsing (`src/woz.rs`) and the write
+//! Host-side check of Apple II 5.25" support: the 6-and-2 and 5-and-3 codecs (`src/a2.rs`),
+//! track building from sector (16 and 13) and `.nib` images, the stepper model, WOZ parsing (`src/woz.rs`) and the write
 //! path (`writes::a2_fields`, `a2::sector_at`, `writes::splice_gcr` on WOZ tracks, and the GCR
 //! separator in `capture.pio` at the Apple II's write clock). The WOZs are made at test time
 //! (`disks.rs`): a DOS 3.3 disk, a ProDOS one, and one whose tracks are longer than its 
@@ -29,7 +29,7 @@ mod woz;
 #[path = "../../src/writes.rs"]
 mod writes;
 
-use a2_decode::decode_track;
+use a2_decode::{decode_track, decode_track13};
 use track::*;
 use writes::{CellTrack, Cells};
 
@@ -269,7 +269,7 @@ fn check_sector_tracks() {
         let img = random_image(tracks, &mut s);
         for t in 0..tracks as u8 {
             let mut buf = [0u32; MAX_TRACK_WORDS];
-            let words = a2::build_track(t, 254, |p| image_sector(&img, order, t, p), &mut buf);
+            let words = a2::build_track(a2::Encoding::SixAndTwo, t, 254, |p| image_sector(&img, order, t, p), &mut buf);
             assert_eq!(words * 32, a2::TRACK_CELLS);
             let cells = buf_cells(&buf, words * 32);
             let found = decode_track(&cells);
@@ -288,11 +288,11 @@ fn check_sector_tracks() {
     let img = random_image(1, &mut s);
     for cells in (48_224..56_000).step_by(37).chain([50_000, 51_024, 51_200, 53_248]) {
         let mut buf = [0u32; MAX_TRACK_WORDS];
-        a2::build_track_cells(0, 254, |p| image_sector(&img, a2::Order::Dos, 0, p), cells, &mut buf).expect("fits");
+        a2::build_track_cells(a2::Encoding::SixAndTwo, 0, 254, |p| image_sector(&img, a2::Order::Dos, 0, p), cells, &mut buf).expect("fits");
         let found = decode_track(&buf_cells(&buf, cells));
         assert_eq!(found.len(), 16, "{cells} cells");
     }
-    assert!(a2::build_track_cells(0, 254, |p| image_sector(&img, a2::Order::Dos, 0, p), 48_000, &mut [0; MAX_TRACK_WORDS]).is_none());
+    assert!(a2::build_track_cells(a2::Encoding::SixAndTwo, 0, 254, |p| image_sector(&img, a2::Order::Dos, 0, p), 48_000, &mut [0; MAX_TRACK_WORDS]).is_none());
     println!("sector tracks: 35/40 tracks, DOS and ProDOS order, every sector decodes in place; fitted lengths 48,224-56,000");
 }
 
@@ -346,13 +346,23 @@ fn check_nib() {
 /// The cells of a DOS 3.3 sector write, as RWTS's WRITE16 sends them: 5 sync (40-cycle `FF`s,
 /// 10 cells), `D5 AA AD`, 343 nibbles, `DE AA EB`, one more `FF`.
 fn a2_write_cells(data: &[u8; 256]) -> Vec<bool> {
+    a2_write_cells_as(a2::Encoding::SixAndTwo, data)
+}
+
+/// [`a2_write_cells`] in either encoding: DOS 3.2's with 12 9-cell syncs (as its writes read on
+/// real disks) and 411 5-and-3 nibbles.
+fn a2_write_cells_as(enc: a2::Encoding, data: &[u8; 256]) -> Vec<bool> {
     let mut bits = vec![];
-    for _ in 0..5 {
+    let (zeros, syncs) = if enc == a2::Encoding::SixAndTwo { (2, 5) } else { (1, 12) };
+    for _ in 0..syncs {
         bits.extend([true; 8]);
-        bits.extend([false; 2]);
+        bits.extend(vec![false; zeros]);
     }
     let mut nibbles = vec![0xD5, 0xAA, 0xAD];
-    a2::encode_data(data, |n| nibbles.push(n));
+    match enc {
+        a2::Encoding::SixAndTwo => a2::encode_data(data, |n| nibbles.push(n)),
+        a2::Encoding::FiveAndThree => a2::encode_data53(data, |n| nibbles.push(n)),
+    }
     nibbles.extend([0xDE, 0xAA, 0xEB, 0xFF]);
     for n in nibbles {
         bits.extend((0..8).rev().map(|k| n >> k & 1 != 0));
@@ -392,17 +402,17 @@ fn check_writes() {
         let data = random_sector(&mut s);
         let got = capture(&a2_write_cells(&data), speed, jitter, rng(&mut s));
         let mut fields = vec![];
-        writes::a2_fields(&Bools(got.clone()), got.len(), |a, d| fields.push((a, *d)));
+        writes::a2_fields(&Bools(got.clone()), got.len(), a2::Encoding::SixAndTwo, |a, _, d| fields.push((a, *d)));
         assert_eq!(fields, vec![(None, data)], "speed {speed} jitter {jitter}");
     }
     let img = random_image(1, &mut s);
     let mut buf = [0u32; MAX_TRACK_WORDS];
-    a2::build_track(0, 254, |p| image_sector(&img, a2::Order::Dos, 0, p), &mut buf);
+    a2::build_track(a2::Encoding::SixAndTwo, 0, 254, |p| image_sector(&img, a2::Order::Dos, 0, p), &mut buf);
     let cells = buf_cells(&buf, a2::TRACK_CELLS);
     // A format (DOS INIT writes a whole track): its address fields name every sector.
     let got = capture(&cells, 0.01, 3, 99);
     let mut found = [false; 16];
-    writes::a2_fields(&Bools(got.clone()), got.len(), |a, d| {
+    writes::a2_fields(&Bools(got.clone()), got.len(), a2::Encoding::SixAndTwo, |a, _, d| {
         let (t, sec) = a.expect("address field");
         assert_eq!(t, 0);
         assert_eq!(d, image_sector(&img, a2::Order::Dos, 0, sec));
@@ -467,7 +477,7 @@ fn check_woz_writes() {
         // A format fitted back into the stored length.
         let img = random_image(1, &mut s);
         let mut buf = [0u32; MAX_TRACK_WORDS];
-        a2::build_track_cells(t, 254, |p| image_sector(&img, a2::Order::Dos, 0, p), stored.n, &mut buf).expect("fits");
+        a2::build_track_cells(a2::Encoding::SixAndTwo, t, 254, |p| image_sector(&img, a2::Order::Dos, 0, p), stored.n, &mut buf).expect("fits");
         writes::copy_track(&mut stored, &buf);
         let found = decode_track(&stored.cells());
         assert_eq!(found.len(), 16);
@@ -553,6 +563,8 @@ struct Run {
 }
 
 struct Dos {
+    /// 16 sectors (DOS 3.3) or 13 (DOS 3.2).
+    enc: a2::Encoding,
     track: Stored,
     /// Absolute time in cells (3.911 µs, the cell the track plays at and the Apple II writes);
     /// the head is over cell `t % n`.
@@ -579,8 +591,9 @@ struct Dos {
 }
 
 impl Dos {
-    fn new(latency: u64) -> Self {
+    fn new(latency: u64, enc: a2::Encoding) -> Self {
         Dos {
+            enc,
             track: Stored { bytes: vec![], n: a2::TRACK_CELLS },
             t: 0,
             shifter: 0,
@@ -607,7 +620,7 @@ impl Dos {
         self.flush();
         let zero = [0u8; 256];
         let mut buf = [0u32; MAX_TRACK_WORDS];
-        let words = a2::build_track(t, 254, |_| &zero, &mut buf);
+        let words = a2::build_track(self.enc, t, 254, |_| &zero, &mut buf);
         self.track.bytes = buf[..words].iter().flat_map(|w| w.to_be_bytes()).collect();
         self.playing_from = self.t + arrive + load;
         self.t += seek;
@@ -641,12 +654,13 @@ impl Dos {
         if self.track.bytes.is_empty() {
             return; // nothing loaded yet
         }
-        let tnum = self.tnum;
+        let (tnum, enc) = (self.tnum, self.enc);
         let sectors = &mut self.sectors;
-        writes::a2_fields(&self.track, a2::TRACK_CELLS + 4_000, |a, d| {
+        writes::a2_fields(&self.track, a2::TRACK_CELLS + 4_000, enc, |a, kind, d| {
             if let Some((t, s)) = a
                 && t == tnum
-                && s < 16
+                && kind == enc
+                && s < enc.sectors()
             {
                 sectors[s as usize] = Some(*d);
             }
@@ -733,9 +747,11 @@ impl Dos {
         self.shifter = 0;
     }
 
-    fn sync(cells: &mut Vec<bool>, n: usize) {
+    /// Sync nibbles: 10 cells (DOS 3.3), or 9 (DOS 3.2).
+    fn sync(&self, cells: &mut Vec<bool>, n: usize) {
         for _ in 0..n {
-            cells.extend([true, true, true, true, true, true, true, true, false, false]);
+            cells.extend([true; 8]);
+            cells.extend(if self.enc == a2::Encoding::SixAndTwo { &[false, false][..] } else { &[false][..] });
         }
     }
 
@@ -748,8 +764,8 @@ impl Dos {
     /// RWTS WRITADR: `syncs` sync nibbles and an address field.
     fn write_address(&mut self, track: u8, sector: u8, syncs: usize) {
         let mut c = vec![];
-        Self::sync(&mut c, syncs);
-        Self::bytes(&mut c, &[0xD5, 0xAA, 0x96]);
+        self.sync(&mut c, syncs);
+        Self::bytes(&mut c, &[0xD5, 0xAA, self.enc.address_mark()]);
         Self::bytes(&mut c, &a2::address_field(254, track, sector));
         Self::bytes(&mut c, &[0xDE, 0xAA, 0xEB]);
         self.write(&c);
@@ -758,7 +774,7 @@ impl Dos {
 
     /// RWTS WRITESEC: 5 syncs, the data field, one more `FF`.
     fn write_data(&mut self, data: &[u8; 256]) {
-        let c = a2_write_cells(data);
+        let c = a2_write_cells_as(self.enc, data);
         self.write(&c);
         self.t += 11;
     }
@@ -769,7 +785,7 @@ impl Dos {
             if self.nibble() != 0xD5 {
                 continue;
             }
-            if self.nibble() != 0xAA || self.nibble() != 0x96 {
+            if self.nibble() != 0xAA || self.nibble() != self.enc.address_mark() {
                 continue;
             }
             let mut f = [0u8; 4];
@@ -797,23 +813,31 @@ impl Dos {
                 break;
             }
         }
-        let mut v = [0u8; a2::DATA_NIBBLES];
+        let mut v = [0u8; a2::DATA_NIBBLES_53];
+        let v = &mut v[..self.enc.data_nibbles()];
         for n in v.iter_mut() {
             *n = self.nibble();
         }
-        let d = a2::decode_data(&v)?;
+        let d = match self.enc {
+            a2::Encoding::SixAndTwo => a2::decode_data((&*v).try_into().unwrap())?,
+            a2::Encoding::FiveAndThree => a2::decode_data53((&*v).try_into().unwrap())?,
+        };
         (self.nibble() == 0xDE && self.nibble() == 0xAA).then_some(d)
     }
 
     /// RWTS FORMAT for one track (FORMATRK and its verify), `syncntr` adjusted as RWTS does.
+    /// DOS 3.2's is modelled on it: its sectors numbered in its skew, sector 0 wanted right
+    /// after the last one written.
     fn format_track(&mut self, track: u8, syncntr: &mut usize) -> bool {
         let zero = [0u8; 256];
+        let (n, enc) = (self.enc.sectors(), self.enc);
+        let last = enc.sector_at(n - 1);
         loop {
             // FORMATRK
             self.write_address(track, 0, 128);
             self.write_data(&zero);
-            for sec in 1..16 {
-                self.write_address(track, sec, *syncntr);
+            for k in 1..n {
+                self.write_address(track, enc.sector_at(k), *syncntr);
                 self.write_data(&zero);
             }
             // Verify: let some sync pass, then sector 0 must be next.
@@ -821,7 +845,7 @@ impl Dos {
 
             let mut readcntr = 48u8;
             let mut verified = [false; 16];
-            let mut left = 16;
+            let mut left = n;
             let mut reformat = false;
             let first = self.read_address();
             match first {
@@ -883,7 +907,7 @@ impl Dos {
             self.retries += 1;
             loop {
                 match self.read_address() {
-                    Some((_, 15)) if self.read_data().is_some() => break,
+                    Some((_, s)) if s == last && self.read_data().is_some() => break,
                     _ => {
                         // NOTLAST (from BADREAD's 0 this wraps to 255 more tries, as on the 6502).
                         readcntr = readcntr.wrapping_sub(1);
@@ -941,7 +965,7 @@ fn check_dos_init() {
     // Core 0's delay applying a capture, and from the head arriving to the track playing (one
     // step in eight slower: an SD write stalling).
     for (latency, load, slow) in [(0.0, 5.0, 5.0), (3.0, 5.0, 5.0), (10.0, 5.0, 5.0), (3.0, 20.0, 20.0), (25.0, 30.0, 30.0), (3.0, 5.0, 60.0)] {
-        let mut d = Dos::new(ms(latency));
+        let mut d = Dos::new(ms(latency), a2::Encoding::SixAndTwo);
         let mut syncntr = 40usize;
         let mut passes = vec![];
         for t in 0..35u8 {
@@ -1012,14 +1036,324 @@ fn check_playback() {
     println!("disk2.pio: {runs} starts, tracks of 33 to 65,535 cells play exactly their cells a revolution, 16 cycles each");
 }
 
+/// 5-and-3 (`a2::encode_data53`) 
+fn check_codec53() {
+    // 32 nibbles: top bit set, never two 0 bits in a row, not the marks' D5 and AA.
+    let mut want = vec![];
+    for b in 0x80..=0xFFu8 {
+        if (0..7).all(|k| b >> k & 3 != 0) && b != 0xD5 && b != 0xAA {
+            want.push(b);
+        }
+    }
+    assert_eq!(want, a2::ENCODE53.to_vec());
+    assert_eq!(a2::ENCODE53, disks::DISK_BYTES_53);
+    for b in 0..=255u8 {
+        assert_eq!(a2::decode5(b), a2::ENCODE53.iter().position(|&x| x == b).map(|v| v as u8));
+    }
+    let mut s = 0x5353u64;
+    for round in 0..2_000 {
+        let data = match round {
+            0 => [0u8; 256],
+            1 => [0xFF; 256],
+            2 => core::array::from_fn(|i| i as u8),
+            _ => random_sector(&mut s),
+        };
+        let mut nibbles = vec![];
+        a2::encode_data53(&data, |n| nibbles.push(n));
+        assert_eq!(nibbles.len(), a2::DATA_NIBBLES_53);
+        assert_eq!(nibbles[..], disks::encode53(&data)[..], "encoder mismatch, round {round}");
+        assert_eq!(a2_decode::decode53(&nibbles), Some(data), "decoder");
+        let arr: [u8; 411] = nibbles.clone().try_into().unwrap();
+        assert_eq!(a2::decode_data53(&arr), Some(data));
+        // A changed nibble is caught (by the checksum, or as a non-5-and-3 nibble).
+        let mut bad = arr;
+        let k = (rng(&mut s) % 411) as usize;
+        bad[k] = if rng(&mut s) % 4 == 0 {
+            0x96 // a 6-and-2 nibble, not a 5-and-3 one
+        } else {
+            a2::ENCODE53[(a2::decode5(bad[k]).unwrap() as usize + 1 + (rng(&mut s) % 30) as usize) % 32]
+        };
+        assert_eq!(a2::decode_data53(&bad), None);
+    }
+    // DOS 3.2's FORMAT numbers sectors 10 apart: 0, 10, 7, 4, 1, …
+    let skew: Vec<u8> = (0..13).map(|k| a2::Encoding::FiveAndThree.sector_at(k)).collect();
+    assert_eq!(skew, disks::DOS32_SKEW.to_vec());
+    let mut sorted = skew.clone();
+    sorted.sort();
+    assert_eq!(sorted, (0..13).collect::<Vec<_>>());
+    assert!((0..16).all(|k| a2::Encoding::SixAndTwo.sector_at(k) == k));
+    assert!((0..13).all(|p| a2::file_sector(a2::Order::Dos32, p) == p as usize));
+    println!("5-and-3: table, damage caught; DOS 3.2 skew {skew:?}");
+}
+
+/// A `.d13` image's sector numbered `sec` of track `track`.
+fn d13_sector(img: &[u8], track: u8, sec: u8) -> &[u8; 256] {
+    img[(track as usize * 13 + sec as usize) * 256..][..256].try_into().unwrap()
+}
+
+/// 13-sector tracks as `Cylinder` builds a `.d13`'s: every sector decodes (independently) in its
+/// place in DOS 3.2's skew, and nothing a 13-sector P6 PROM couldn't read (two 0s in a row).
+fn check_d13_tracks() {
+    let mut s = 0xD13u64;
+    let enc = a2::Encoding::FiveAndThree;
+    for tracks in [35usize, 40] {
+        let img: Vec<u8> = (0..tracks * a2::TRACK_BYTES_13).map(|_| rng(&mut s) as u8).collect();
+        assert_eq!(img.len(), [116_480, 133_120][(tracks == 40) as usize]);
+        for t in 0..tracks as u8 {
+            let mut buf = [0u32; MAX_TRACK_WORDS];
+            let words = a2::build_track(enc, t, 254, |p| d13_sector(&img, t, a2::file_sector(a2::Order::Dos32, p) as u8), &mut buf);
+            assert_eq!(words * 32, a2::TRACK_CELLS);
+            let cells = buf_cells(&buf, a2::TRACK_CELLS);
+            let found = decode_track13(&cells);
+            assert_eq!(found.len(), 13, "track {t}");
+            for (k, &(trk, sec, vol, d)) in found.iter().enumerate() {
+                assert_eq!((trk, sec, vol), (t, disks::DOS32_SKEW[k], 254), "track {t}");
+                assert_eq!(&d, d13_sector(&img, t, sec));
+            }
+            // No 16-sector fields, and never two 0 cells in a row, across the wrap too.
+            assert!(decode_track(&cells).is_empty());
+            let n = cells.len();
+            assert!((0..n).all(|i| cells[i] || cells[(i + 1) % n]), "track {t}: 00 in the cells");
+            let mut w = weak::WeakList::new();
+            w.find_runs(&buf, a2::TRACK_CELLS, weak::A2_RUN);
+            assert_eq!(w.len(), 0);
+            // The firmware's own decoder finds them too, as 5-and-3, by default either way.
+            for default in [a2::Encoding::SixAndTwo, enc] {
+                let mut got = 0;
+                writes::a2_fields(&Bools(cells.iter().chain(&cells[..4_000]).copied().collect()), n + 4_000, default, |a, kind, d| {
+                    let (tt, sec) = a.expect("address field");
+                    assert_eq!((tt, kind), (t, enc));
+                    assert_eq!(d, d13_sector(&img, t, sec));
+                    got |= 1u16 << sec;
+                });
+                assert_eq!(got, 0x1FFF, "track {t}");
+            }
+        }
+    }
+    // Fitted to other lengths (13-sector WOZ tracks being reformatted).
+    let img: Vec<u8> = (0..a2::TRACK_BYTES_13).map(|_| rng(&mut s) as u8).collect();
+    for cells in (47_000..56_000).step_by(41).chain([50_000, 51_024, 51_200]) {
+        let mut buf = [0u32; MAX_TRACK_WORDS];
+        a2::build_track_cells(enc, 0, 254, |p| d13_sector(&img, 0, p), cells, &mut buf).expect("fits");
+        assert_eq!(decode_track13(&buf_cells(&buf, cells)).len(), 13, "{cells} cells");
+    }
+    assert!(a2::build_track_cells(enc, 0, 254, |p| d13_sector(&img, 0, p), 46_000, &mut [0; MAX_TRACK_WORDS]).is_none());
+    println!("13-sector tracks: 35/40-track .d13, every sector decodes in DOS 3.2's skew, no 00 cells; fitted lengths 47,000-56,000");
+}
+
+/// DOS 3.2 writes through the separator: a sector write (no address field) is 5-and-3 by the
+/// disk's kind, a format's by its `D5 AA B5` address fields; and a 16-sector one still decodes on
+/// a 13-sector disk's default.
+fn check_writes53() {
+    let mut s = 0x3232u64;
+    let enc = a2::Encoding::FiveAndThree;
+    for (speed, jitter) in [(0.0, 2), (-0.02, 3), (0.02, 3), (0.0, 5)] {
+        let data = random_sector(&mut s);
+        let got = capture(&a2_write_cells_as(enc, &data), speed, jitter, rng(&mut s));
+        let mut fields = vec![];
+        writes::a2_fields(&Bools(got.clone()), got.len(), enc, |a, kind, d| fields.push((a, kind, *d)));
+        assert_eq!(fields, vec![(None, enc, data)], "speed {speed} jitter {jitter}");
+        // On a 16-sector disk's default it's no 6-and-2 field.
+        let mut six = 0;
+        writes::a2_fields(&Bools(got.clone()), got.len(), a2::Encoding::SixAndTwo, |_, _, _| six += 1);
+        assert_eq!(six, 0);
+    }
+    let img: Vec<u8> = (0..a2::TRACK_BYTES_13).map(|_| rng(&mut s) as u8).collect();
+    let mut buf = [0u32; MAX_TRACK_WORDS];
+    a2::build_track(enc, 3, 254, |p| d13_sector(&img, 0, p), &mut buf);
+    let got = capture(&buf_cells(&buf, a2::TRACK_CELLS), 0.01, 3, 77);
+    let mut found = 0u16;
+    writes::a2_fields(&Bools(got.clone()), got.len(), a2::Encoding::SixAndTwo, |a, kind, d| {
+        let (t, sec) = a.expect("address field");
+        assert_eq!((t, kind), (3, enc));
+        assert_eq!(d, d13_sector(&img, 0, sec));
+        found |= 1 << sec;
+    });
+    assert_eq!(found, 0x1FFF);
+    // A 16-sector format captured, decoded on a 13-sector disk's default: its address fields win.
+    let img16 = random_image(1, &mut s);
+    a2::build_track(a2::Encoding::SixAndTwo, 0, 254, |p| image_sector(&img16, a2::Order::Dos, 0, p), &mut buf);
+    let got = capture(&buf_cells(&buf, a2::TRACK_CELLS), 0.0, 2, 78);
+    let mut n16 = 0;
+    writes::a2_fields(&Bools(got.clone()), got.len(), enc, |a, kind, _| {
+        assert!(a.is_some() && kind == a2::Encoding::SixAndTwo);
+        n16 += 1;
+    });
+    assert_eq!(n16, 16);
+    // A capture with a D5 AA B5 address field is a formatter's: copied at the head.
+    let mut c = vec![];
+    for _ in 0..20 {
+        c.extend([true; 8]);
+        c.push(false);
+    }
+    for b in [0xD5u8, 0xAA, 0xB5].into_iter().chain(a2::address_field(254, 5, 7)).chain([0xDE, 0xAA, 0xEB]) {
+        c.extend((0..8).rev().map(|k| b >> k & 1 != 0));
+    }
+    let mut track = Stored { bytes: vec![0xFF; a2::TRACK_CELLS / 8], n: a2::TRACK_CELLS };
+    let w = writes::splice_a2(&mut track, 1_000, None, &Bools(c.clone()), c.len(), false, false).expect("address write");
+    assert_eq!(w.end, 1_000 + c.len() - c.iter().rev().position(|&b| b).unwrap());
+    assert!((0..c.len()).all(|i| track.bit(1_000 + i) == c[i]));
+    // A sector write whose gate edge the separator took for a 1, just ahead of the first sync:
+    // with 9-cell syncs the framing wouldn't recover before the data mark, so `splice_a2` drops
+    // it, and the sector lands in place. Every sector, held as a `.d13`'s track is.
+    a2::build_track(enc, 3, 254, |p| d13_sector(&img, 0, p), &mut buf);
+    let mut held = Stored { bytes: buf[..a2::TRACK_CELLS / 32].iter().flat_map(|w| w.to_be_bytes()).collect(), n: a2::TRACK_CELLS };
+    let mut want: Vec<[u8; 256]> = (0..13).map(|k| *d13_sector(&img, 0, k)).collect();
+    for sec in 0..13u8 {
+        let nibs = disks::frame(&held.cells());
+        let k = (3..nibs.len() - 12)
+            .find(|&k| (nibs[k - 3].0, nibs[k - 2].0, nibs[k - 1].0) == (0xD5, 0xAA, 0xB5) && a2::decode44(nibs[k + 4].0, nibs[k + 5].0) == sec)
+            .expect("address field");
+        let pos = nibs[k + 10].1 + 30;
+        let data = random_sector(&mut s);
+        let mut cap = vec![false; 7];
+        cap.push(true); // the gate's edge
+        cap.extend(a2_write_cells_as(enc, &data));
+        cap.extend([false; 40]);
+        writes::splice_a2(&mut held, pos, None, &Bools(cap.clone()), cap.len(), false, false).expect("sector write");
+        want[sec as usize] = data;
+    }
+    let mut after: Vec<(u8, [u8; 256])> = decode_track13(&held.cells()).iter().map(|f| (f.1, f.3)).collect();
+    after.sort_by_key(|f| f.0);
+    assert_eq!(after.len(), 13);
+    assert!(after.iter().all(|(k, d)| *d == want[*k as usize]), "sector writes with a gate edge");
+    println!("DOS 3.2 writes: sector writes decode at ±2% and ±5 cycles as 5-and-3, formats by their D5 AA B5 fields, a D5 AA B5 write copied at the head, a gate edge before 9-cell sync dropped");
+}
+
+/// DOS 3.2's INIT (its FORMAT modelled on DOS 3.3's RWTS: field-at-a-time writes, the verify
+/// that wants sector 0 after the last one written) on 13-sector tracks held as the firmware
+/// holds a `.d13`'s, then sector writes into them.
+fn check_dos32_init() {
+    let ms = |x: f64| (x * 1000.0 / 3.9111) as u64;
+    for (latency, load) in [(0.0, 5.0), (3.0, 5.0), (10.0, 20.0), (25.0, 30.0)] {
+        let mut d = Dos::new(ms(latency), a2::Encoding::FiveAndThree);
+        let mut syncntr = 40usize;
+        let mut passes = vec![];
+        for t in 0..35u8 {
+            d.load(t, ms(load));
+            let before = d.retries;
+            assert!(d.format_track(t, &mut syncntr), "latency {latency} ms: I/O error on track {t}, sync {syncntr}");
+            assert!(d.read_check(), "track {t}: sector 0 after the format");
+            passes.push(d.retries - before);
+            d.flush();
+            assert!(d.sectors[..13].iter().all(|s| *s == Some([0; 256])), "track {t}");
+            assert!(d.sectors[13..].iter().all(|s| s.is_none()));
+            if t == 17 || t == 0 {
+                for sec in [0u8, 12, 3, 10] {
+                    let data = random_sector(&mut d.s);
+                    assert!(d.write_sector(sec, &data), "track {t} sector {sec}: address not found");
+                    d.flush();
+                    assert_eq!(d.sectors[sec as usize], Some(data), "track {t} sector {sec} after a write");
+                    assert_eq!(d.read_sector(sec), Some(data), "track {t} sector {sec} read back");
+                }
+            }
+        }
+        println!("DOS 3.2 INIT, core 0 {latency} ms behind, tracks playing {load} ms after a step: gap down to {syncntr} syncs, reformats per track {passes:?}");
+    }
+}
+
+/// A 13-sector WOZ: tracks rotated into a gap (`moof::find_rotation` knows `D5 AA B5`), every
+/// sector found by `writes::a2_fields` as by the independent decoder, the catalog chain on track
+/// 17, sector writes spliced (also over `damaged`'s data field, whose mark is broken), a format
+/// re-encoded as 13 sectors.
+fn check_woz13(name: &str, file: &[u8], img: &[u8], damaged: Option<(u8, u8)>) {
+    let h: [u8; woz::HEADER_BYTES] = file[..woz::HEADER_BYTES].try_into().unwrap();
+    let w = woz::Woz::parse(&h, &[0; woz::QUARTERS], None, file.len().div_ceil(BLOCK), MAX_TRACK_BLOCKS).unwrap();
+    let mut s = 0x1313u64;
+    let mut lengths = (usize::MAX, 0);
+    for t in 0..35u8 {
+        let trk = w.trk(w.track(t * 4)).unwrap();
+        let start = trk.start as usize * BLOCK;
+        let mut stored = Stored { bytes: file[start..start + trk.blocks as usize * BLOCK].to_vec(), n: trk.bits as usize };
+        let n = stored.n;
+        lengths = (lengths.0.min(n), lengths.1.max(n));
+        let bad = damaged.filter(|d| d.0 == t).map(|d| d.1);
+        let whole = 13 - bad.is_some() as usize;
+        // The loop wraps between a data field and the next address field: one pass from the
+        // rotation, not looping, holds every sector whole.
+        let rot = moof::find_rotation(|i| stored.bytes[i], trk.bits) as usize;
+        let mut once: Vec<bool> = (0..n).map(|i| stored.bit(rot + i)).collect();
+        once.extend(vec![false; n]);
+        let found = decode_track13(&once);
+        assert_eq!(found.len(), whole, "{name} track {t}: sectors whole from the rotation");
+        for &(trk_n, sec, _, d) in &found {
+            assert_eq!(trk_n, t);
+            assert_ne!(Some(sec), bad);
+            assert_eq!(&d, d13_sector(img, t, sec));
+        }
+        // The firmware's decoder (a format re-encoded, `a2_reformat`) finds the same, whatever its
+        // default.
+        for default in [a2::Encoding::SixAndTwo, a2::Encoding::FiveAndThree] {
+            let mut by_fw = 0u16;
+            writes::a2_fields(&Bools(once[..n].to_vec()), n, default, |a, kind, d| {
+                let (trk_n, sec) = a.expect("address field");
+                assert_eq!((trk_n, kind), (t, a2::Encoding::FiveAndThree));
+                assert_eq!(d, d13_sector(img, t, sec), "{name} track {t} sector {sec}: a2_fields");
+                by_fw |= 1 << sec;
+            });
+            assert_eq!(by_fw.count_ones() as usize, whole, "{name} track {t}: a2_fields");
+        }
+        if t == 17 {
+            // VTOC: catalog at 17/12, DOS 3.2's 13 sectors a track; the catalog links down.
+            let v = d13_sector(img, 17, 0);
+            assert_eq!((v[1], v[2], v[3], v[0x35]), (17, 12, 2, 13));
+            let sec = |k: u8| found.iter().find(|f| f.1 == k).unwrap().3;
+            let mut at = 12;
+            while at > 1 {
+                let c = sec(at);
+                assert_eq!((c[1], c[2]), (17, at - 1));
+                at -= 1;
+            }
+        }
+        if ![0u8, 17, 34].contains(&t) && bad.is_none() {
+            continue;
+        }
+        // Rewrite each sector, the gate opening after its address field.
+        let mut want: Vec<[u8; 256]> = (0..13).map(|k| *d13_sector(img, t, k)).collect();
+        for sec in 0..13u8 {
+            let data = random_sector(&mut s);
+            // Twice around: a track may start anywhere, even in an address field.
+            let nibs = disks::frame(&[stored.cells(), stored.cells()].concat());
+            let k = (3..nibs.len() - 12)
+                .find(|&k| (nibs[k - 3].0, nibs[k - 2].0, nibs[k - 1].0) == (0xD5, 0xAA, 0xB5) && a2::decode44(nibs[k + 4].0, nibs[k + 5].0) == sec)
+                .expect("address field");
+            let pos = nibs[k + 10].1 % n;
+            let got = capture(&a2_write_cells_as(a2::Encoding::FiveAndThree, &data), 0.0, 2, rng(&mut s));
+            writes::splice_gcr(&mut stored, pos + 20, &Bools(got.clone()), got.len()).expect("splice");
+            want[sec as usize] = data;
+        }
+        let mut after: Vec<(u8, [u8; 256])> = decode_track13(&stored.cells()).iter().map(|f| (f.1, f.3)).collect();
+        after.sort_by_key(|f| f.0);
+        assert_eq!(after.len(), 13, "{name} track {t}: every sector after the writes");
+        assert!(after.iter().all(|(k, d)| *d == want[*k as usize]), "{name} track {t}: rewritten sectors");
+        // A format fitted back into the stored length, as `a2_reformat` does for 13 sectors.
+        let fresh: Vec<u8> = (0..a2::TRACK_BYTES_13).map(|_| rng(&mut s) as u8).collect();
+        let mut buf = [0u32; MAX_TRACK_WORDS];
+        a2::build_track_cells(a2::Encoding::FiveAndThree, t, 254, |p| d13_sector(&fresh, 0, p), n, &mut buf).expect("fits");
+        writes::copy_track(&mut stored, &buf);
+        let found = decode_track13(&stored.cells());
+        assert_eq!(found.len(), 13);
+        assert!(found.iter().all(|f| f.0 == t && &f.3 == d13_sector(&fresh, 0, f.1)));
+    }
+    let also = damaged.map_or(String::new(), |(t, sec)| format!(", track {t} (sector {sec}'s data mark broken)"));
+    println!("{name}: tracks of {}-{} cells wrap in a gap, a2_fields finds every sector, catalog chain on track 17; tracks 0, 17, 34{also} rewritten by splice and reformatted to their length", lengths.0, lengths.1);
+}
+
 fn main() {
     check_playback();
     check_codec();
+    check_codec53();
+    check_d13_tracks();
     check_stepper();
     check_sector_tracks();
     check_nib();
     check_writes();
     check_dos_init();
+    check_writes53();
+    check_dos32_init();
+    let img = disks::dos32_image();
+    check_woz13("13-sector WOZ", &disks::woz525_13(&img, 51_000), &img, None);
+    check_woz13("DOS 3.2 WOZ as real disks read", &disks::dos32_woz(&img, Some((2, 12))), &img, Some((2, 12)));
     check_blank_woz("DOS 3.3 WOZ", &disks::woz525(&disks::dos33_image(), false, 51_200, 32));
     check_blank_woz("ProDOS WOZ", &disks::woz525(&disks::prodos_image(), true, 51_000, 32));
     check_woz_writes();

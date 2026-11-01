@@ -11,8 +11,9 @@
 //! images of any size (`.hda`/`.hfs`/`.img`/`.dsk`/`.image`), served by [`load_hd`]; see `dcd.rs`.
 //!
 //! In Apple II mode ([`Filter::Apple2`]) they are 5.25" disks: 140K (35-track) or 160K (40-track)
-//! sector images in DOS 3.3 or ProDOS order (`.dsk`/`.do`/`.po`), `.nib` nibble images, `.2mg`
-//! wrapping either, and WOZ 1/2 bitstreams (`.woz`); see `a2.rs` and `woz.rs`.
+//! sector images in DOS 3.3 or ProDOS order (`.dsk`/`.do`/`.po`), 116K/130K 13-sector (DOS 3.2)
+//! images (`.d13`, or `.dsk`/`.do` of those sizes), `.nib` nibble images, `.2mg` wrapping a
+//! 16-sector or `.nib` image, and WOZ 1/2 bitstreams (`.woz`); see `a2.rs` and `woz.rs`.
 //!
 //! In Apple II 3.5" mode ([`Filter::Apple35`]) they are 400K/800K disks for an Apple 3.5 Drive:
 //! raw block images (`.po`/`.dsk`/`.img`/`.image`/`.hdv`, ProDOS order, which is the Mac's),
@@ -164,8 +165,8 @@ pub enum Disk {
     Mfm { format: mfm::Format, offset: u16 },
     /// Bitstream, played as stored.
     Moof(Moof),
-    /// Apple II 5.25" sectors, 16 per track: `tracks` (35 or 40) of them in `order`, from byte
-    /// `offset` (a `.2mg` header). `volume` goes in the address fields. `locked`: a `.2mg` marked
+    /// Apple II 5.25" sectors, 16 per track (13 in `a2::Order::Dos32`): `tracks` (35 or 40) of
+    /// them in `order`, from byte `offset` (a `.2mg` header). `volume` goes in the address fields. `locked`: a `.2mg` marked
     /// write-protected.
     A2 { order: a2::Order, tracks: u8, volume: u8, offset: u16, locked: bool },
     /// Apple II nibbles, 6,656 per track, from byte `offset`. Played read-only.
@@ -279,6 +280,8 @@ impl Disk {
                 (false, _, false) => "MOOF 800K",
                 (false, _, true) => "MOOF 800K flux",
             },
+            Disk::A2 { order: a2::Order::Dos32, tracks: 35, .. } => "116K DOS 3.2",
+            Disk::A2 { order: a2::Order::Dos32, .. } => "130K DOS 3.2",
             Disk::A2 { order: a2::Order::Dos, tracks: 35, .. } => "140K DOS order",
             Disk::A2 { order: a2::Order::Dos, .. } => "160K DOS order",
             Disk::A2 { tracks: 35, .. } => "140K ProDOS order",
@@ -327,6 +330,8 @@ enum Kind {
     /// Apple II sectors: 35 or 40 tracks, in ProDOS order (`Some(true)`), DOS order
     /// (`Some(false)`), or to be worked out from the contents (`.dsk`).
     A2 { tracks: u8, prodos: Option<bool> },
+    /// Apple II 13-sector (DOS 3.2) sectors, 35 or 40 tracks.
+    D13 { tracks: u8 },
     /// Apple II nibbles, 35 or 40 tracks.
     Nib { tracks: u8 },
     Woz,
@@ -401,7 +406,11 @@ impl Kind {
                 35 | 40 if size as usize % track_bytes == 0 => Some((size as usize / track_bytes) as u8),
                 _ => None,
             };
-            return if is(&["dsk", "do", "po"]) {
+            // A 13-sector image's size is no 16-sector one's.
+            let d13 = tracks(a2::TRACK_BYTES_13);
+            return if is(&["d13"]) || (is(&["dsk", "do"]) && d13.is_some()) {
+                d13.map(|tracks| Kind::D13 { tracks })
+            } else if is(&["dsk", "do", "po"]) {
                 let prodos = if is(&["po"]) { Some(true) } else if is(&["do"]) { Some(false) } else { None };
                 tracks(a2::TRACK_BYTES).map(|tracks| Kind::A2 { tracks, prodos })
             } else if is(&["nib"]) {
@@ -479,6 +488,8 @@ impl Candidate {
             Kind::Blocks => "BLK",
             Kind::A2 { tracks: 35, .. } => "140K",
             Kind::A2 { .. } => "160K",
+            Kind::D13 { tracks: 35 } => "116K",
+            Kind::D13 { .. } => "130K",
             Kind::Nib { .. } => "NIB",
             Kind::Woz | Kind::Woz35 => "WOZ",
             Kind::A2r => "A2R",
@@ -891,6 +902,7 @@ fn load_candidate(
             };
             (Disk::A2 { order, tracks, volume: a2::VOLUME, offset: 0, locked: false }, note)
         }
+        Kind::D13 { tracks } => (Disk::A2 { order: a2::Order::Dos32, tracks, volume: a2::VOLUME, offset: 0, locked: false }, "13-sector"),
         Kind::Nib { tracks } => (Disk::Nib { tracks, offset: 0 }, "read-only"),
         Kind::TwoImg => (two_img(&header[..TWO_IMG_HEADER], c.size, c.filter)?, "2MG"),
         Kind::Woz => {
@@ -1317,7 +1329,7 @@ where
     D::Error: Debug,
 {
     match c.kind {
-        Kind::A2 { .. } | Kind::Nib { .. } | Kind::A2r => Ok(1),
+        Kind::A2 { .. } | Kind::D13 { .. } | Kind::Nib { .. } | Kind::A2r => Ok(1),
         Kind::TwoImg => Ok((c.size < (TWO_IMG_HEADER + IMAGE_400K) as u64) as usize),
         Kind::Woz => {
             // INFO's disk type: 1 = 5.25", 2 = 3.5".
